@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export REMOTE_ASKPASS_COMMAND_HINT="$*"
+export SUDO_ASKPASS="${SUDO_ASKPASS:-$HOME/.local/bin/remote-askpass}"
+exec sudo -A "$@"

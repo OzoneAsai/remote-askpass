@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_PATH="${REMOTE_ASKPASS_CONFIG:-$HOME/.config/remote-askpass/config.json}"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "remote-askpass: curl not found" >&2
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "remote-askpass: python3 not found" >&2
+  exit 1
+fi
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "remote-askpass: config not found: $CONFIG_PATH" >&2
+  exit 1
+fi
+
+prompt="${1:-sudo password:}"
+host="$(hostname 2>/dev/null || true)"
+user="$(id -un 2>/dev/null || true)"
+cwd="$(pwd 2>/dev/null || true)"
+nonce="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(16))
+PY
+)"
+
+read_config_json() {
+  python3 - "$CONFIG_PATH" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
+
+print(cfg.get('agent_url', ''))
+print(int(cfg.get('connect_timeout_seconds', 3)))
+print(int(cfg.get('request_timeout_seconds', 35)))
+print(bool(cfg.get('send_host', True)))
+print(bool(cfg.get('send_user', True)))
+print(bool(cfg.get('send_cwd', True)))
+print(bool(cfg.get('send_command_hint', False)))
+print(cfg.get('client_cert_path', ''))
+print(cfg.get('client_key_path', ''))
+print(cfg.get('server_ca_path', ''))
+PY
+}
+
+mapfile -t cfg < <(read_config_json)
+agent_url="${cfg[0]}"
+connect_timeout="${cfg[1]}"
+request_timeout="${cfg[2]}"
+send_host="${cfg[3]}"
+send_user="${cfg[4]}"
+send_cwd="${cfg[5]}"
+send_command_hint="${cfg[6]}"
+client_cert_path="${cfg[7]}"
+client_key_path="${cfg[8]}"
+server_ca_path="${cfg[9]}"
+
+if [[ -z "$agent_url" ]]; then
+  echo "remote-askpass: agent_url is empty in config" >&2
+  exit 1
+fi
+
+args=(
+  --silent
+  --show-error
+  --fail
+  --get
+  --connect-timeout "$connect_timeout"
+  --max-time "$request_timeout"
+  --data-urlencode "prompt=$prompt"
+  --data-urlencode "nonce=$nonce"
+)
+
+[[ "$send_host" == "True" ]] && args+=(--data-urlencode "host=$host")
+[[ "$send_user" == "True" ]] && args+=(--data-urlencode "user=$user")
+[[ "$send_cwd" == "True" ]] && args+=(--data-urlencode "cwd=$cwd")
+
+if [[ "$send_command_hint" == "True" && -n "${REMOTE_ASKPASS_COMMAND_HINT:-}" ]]; then
+  args+=(--data-urlencode "command=${REMOTE_ASKPASS_COMMAND_HINT}")
+fi
+
+if [[ -n "$client_cert_path" ]]; then
+  args+=(--cert "$client_cert_path")
+fi
+if [[ -n "$client_key_path" ]]; then
+  args+=(--key "$client_key_path")
+fi
+if [[ -n "$server_ca_path" ]]; then
+  args+=(--cacert "$server_ca_path")
+fi
+
+password="$(curl "${args[@]}" "$agent_url")" || {
+  echo "remote-askpass: request failed" >&2
+  exit 1
+}
+
+if [[ -z "$password" ]]; then
+  echo "remote-askpass: empty response" >&2
+  exit 1
+fi
+
+printf '%s\n' "$password"
