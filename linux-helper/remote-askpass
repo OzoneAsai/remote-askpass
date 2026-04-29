@@ -62,6 +62,15 @@ client_cert_path="${cfg[7]}"
 client_key_path="${cfg[8]}"
 server_ca_path="${cfg[9]}"
 
+expand_config_path() {
+  local value="$1"
+  case "$value" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${value#~/}" ;;
+    *) printf '%s\n' "$value" ;;
+  esac
+}
+
 if [[ -z "$agent_url" ]]; then
   echo "remote-askpass: agent_url is empty in config" >&2
   exit 1
@@ -87,12 +96,15 @@ if [[ "$send_command_hint" == "True" && -n "${REMOTE_ASKPASS_COMMAND_HINT:-}" ]]
 fi
 
 if [[ -n "$client_cert_path" ]]; then
+  client_cert_path="$(expand_config_path "$client_cert_path")"
   args+=(--cert "$client_cert_path")
 fi
 if [[ -n "$client_key_path" ]]; then
+  client_key_path="$(expand_config_path "$client_key_path")"
   args+=(--key "$client_key_path")
 fi
 if [[ -n "$server_ca_path" ]]; then
+  server_ca_path="$(expand_config_path "$server_ca_path")"
   args+=(--cacert "$server_ca_path")
 fi
 

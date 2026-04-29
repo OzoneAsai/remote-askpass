@@ -13,7 +13,7 @@ install -m 700 "$(dirname "$0")/rsudo" "$BIN_DIR/rsudo"
 if [[ ! -f "$CFG_DIR/config.json" ]]; then
   cat > "$CFG_DIR/config.json" <<'JSON'
 {
-  "agent_url": "https://windows-host.tailnet-name.ts.net:7878/ask",
+  "agent_url": "https://windows-host.tailnet-name.ts.net:17878/ask",
   "transport_mode": "tailscale",
   "tls_mode": "mtls",
   "client_cert_path": "~/.config/remote-askpass/client.crt",

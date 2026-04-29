@@ -254,3 +254,9 @@ remote-askpass-bridge/
 ## 22. 命名
 
 初期名は **Remote Askpass Bridge** とする。
+
+## 23. Windows MVP 実装メモ
+
+現行Windows Agent MVPでは pairing window は既定で自動失効しない。ユーザーが `/pairing/disable` で閉じるか、設定 `pairing_window_seconds` に正の値を指定した場合のみ期限で閉じる。
+
+`/pair` は `public_key_pem` の保存に加え、`csr_pem` が渡された場合はOpenSSLを使ってローカルCAを必要時生成し、client certificate を発行する。`tls_mode = "mtls"` ではHTTPS listener がローカルCAで署名された client certificate を検証する。
