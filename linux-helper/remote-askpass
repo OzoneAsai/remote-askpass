@@ -47,6 +47,7 @@ print(bool(cfg.get('send_command_hint', False)))
 print(cfg.get('client_cert_path', ''))
 print(cfg.get('client_key_path', ''))
 print(cfg.get('server_ca_path', ''))
+print(cfg.get('tls_mode', 'server_tls'))
 PY
 }
 
@@ -61,6 +62,7 @@ send_command_hint="${cfg[6]}"
 client_cert_path="${cfg[7]}"
 client_key_path="${cfg[8]}"
 server_ca_path="${cfg[9]}"
+tls_mode="${cfg[10]}"
 
 expand_config_path() {
   local value="$1"
@@ -93,6 +95,10 @@ args=(
 
 if [[ "$send_command_hint" == "True" && -n "${REMOTE_ASKPASS_COMMAND_HINT:-}" ]]; then
   args+=(--data-urlencode "command=${REMOTE_ASKPASS_COMMAND_HINT}")
+fi
+
+if [[ "$agent_url" == https://* && -z "$server_ca_path" ]]; then
+  args+=(--insecure)
 fi
 
 if [[ -n "$client_cert_path" ]]; then

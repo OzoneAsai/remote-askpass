@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     ffi::c_void,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::BufReader,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -32,10 +32,7 @@ use rustls::{
     RootCertStore, ServerConfig,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{
-    net::TcpListener,
-    sync::{watch, Mutex as AsyncMutex},
-};
+use tokio::sync::{watch, Mutex as AsyncMutex};
 use tracing::{error, info, warn};
 
 const APP_NAME: &str = "RemoteAskpassBridge";
@@ -125,6 +122,7 @@ struct Config {
 #[serde(rename_all = "snake_case")]
 enum TlsMode {
     DisabledForLocalTesting,
+    ServerTls,
     Mtls,
 }
 
@@ -136,10 +134,10 @@ impl Default for Config {
             dialog_timeout_seconds: 30,
             recent_request_limit: 50,
             startup_enabled: false,
-            tls_mode: TlsMode::DisabledForLocalTesting,
+            tls_mode: TlsMode::ServerTls,
             allowed_hosts: Vec::new(),
             certificate_days: 825,
-            linux_config_agent_url: format!("http://127.0.0.1:{DEFAULT_PORT}/ask"),
+            linux_config_agent_url: format!("https://127.0.0.1:{DEFAULT_PORT}/ask"),
             openssl_path: "openssl".to_string(),
             server_hostname: "remote-askpass-agent.local".to_string(),
             server_cert_path: "certs/server.crt".to_string(),
@@ -334,9 +332,14 @@ struct IssuedClientMaterial {
     server_ca_pem: String,
 }
 
+#[cfg(windows)]
 struct SingleInstanceGuard {
-    file: Option<File>,
-    path: PathBuf,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(not(windows))]
+struct SingleInstanceGuard {
+    _file: File,
 }
 
 #[derive(Debug, Serialize)]
@@ -573,16 +576,28 @@ async fn run_server(
         spawn_tray(state.clone(), shutdown_tx.clone());
     }
     match config.tls_mode {
-        TlsMode::DisabledForLocalTesting => {
-            let listener = TcpListener::bind(config.listen_addr)
+        TlsMode::DisabledForLocalTesting | TlsMode::ServerTls => {
+            if config.tls_mode == TlsMode::DisabledForLocalTesting {
+                warn!(
+                    "tls_mode=disabled_for_local_testing is legacy; serving encrypted TLS anyway"
+                );
+            }
+            let tls_config = build_server_tls_rustls_config(&config, &data_dir)?;
+            let handle = Handle::new();
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal(shutdown_rx).await;
+                shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            });
+            info!(
+                "Remote Askpass Agent listening with encrypted TLS on https://{}",
+                config.listen_addr
+            );
+            axum_server::bind_rustls(config.listen_addr, tls_config)
+                .handle(handle)
+                .serve(app.into_make_service())
                 .await
-                .with_context(|| format!("failed to bind {}", config.listen_addr))?;
-            let actual_addr = listener.local_addr()?;
-            info!("Remote Askpass Agent listening on http://{actual_addr}");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal(shutdown_rx))
-                .await
-                .context("server failed")
+                .context("TLS server failed")
         }
         TlsMode::Mtls => {
             let tls_config = build_mtls_rustls_config(&config, &data_dir)?;
@@ -1037,6 +1052,8 @@ fn save_pairing_record(data_dir: &Path, record: &PairingRecord) -> Result<()> {
 
 fn build_mtls_rustls_config(config: &Config, data_dir: &Path) -> Result<RustlsConfig> {
     install_rustls_crypto_provider();
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
     ensure_ca_material(config, data_dir)?;
     ensure_server_certificate(config, data_dir)?;
 
@@ -1059,6 +1076,25 @@ fn build_mtls_rustls_config(config: &Config, data_dir: &Path) -> Result<RustlsCo
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(server_certs, server_key)
         .context("failed to build mTLS server config")?;
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(RustlsConfig::from_config(Arc::new(server_config)))
+}
+
+fn build_server_tls_rustls_config(config: &Config, data_dir: &Path) -> Result<RustlsConfig> {
+    install_rustls_crypto_provider();
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
+    ensure_ca_material(config, data_dir)?;
+    ensure_server_certificate(config, data_dir)?;
+
+    let server_cert_path = resolve_data_path(data_dir, &config.server_cert_path);
+    let server_key_path = resolve_data_path(data_dir, &config.server_key_path);
+    let server_certs = load_certificates(&server_cert_path)?;
+    let server_key = load_private_key(&server_key_path)?;
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(server_certs, server_key)
+        .context("failed to build TLS server config")?;
     server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(RustlsConfig::from_config(Arc::new(server_config)))
 }
@@ -1242,7 +1278,7 @@ fn linux_helper_config(config: &Config) -> LinuxHelperConfig {
         agent_url: config.linux_config_agent_url.clone(),
         transport_mode: "tailscale".to_string(),
         tls_mode: match config.tls_mode {
-            TlsMode::DisabledForLocalTesting => "disabled_for_local_testing",
+            TlsMode::DisabledForLocalTesting | TlsMode::ServerTls => "server_tls",
             TlsMode::Mtls => "mtls",
         }
         .to_string(),
@@ -1325,12 +1361,56 @@ fn safe_file_stem(value: &str) -> String {
     }
 }
 
+#[cfg(windows)]
+impl SingleInstanceGuard {
+    fn acquire(data_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(data_dir)
+            .with_context(|| format!("failed to create {}", data_dir.display()))?;
+        let mutex_name = single_instance_mutex_name(data_dir)?;
+        let mutex_name_wide = to_wide_null(&mutex_name);
+        let handle = unsafe {
+            windows_sys::Win32::System::Threading::CreateMutexW(
+                std::ptr::null(),
+                0,
+                mutex_name_wide.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err(anyhow!(
+                "failed to create single-instance mutex {}",
+                mutex_name
+            ));
+        }
+        let last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        if last_error == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+            return Err(anyhow!(
+                "another Remote Askpass Agent appears to be running; mutex already exists: {}",
+                mutex_name
+            ));
+        }
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(not(windows))]
 impl SingleInstanceGuard {
     fn acquire(data_dir: &Path) -> Result<Self> {
         fs::create_dir_all(data_dir)
             .with_context(|| format!("failed to create {}", data_dir.display()))?;
         let lock_path = data_dir.join("agent.lock");
-        let file = OpenOptions::new()
+        let file = File::options()
             .write(true)
             .create_new(true)
             .open(&lock_path)
@@ -1340,20 +1420,41 @@ impl SingleInstanceGuard {
                     lock_path.display()
                 )
             })?;
-        Ok(Self {
-            file: Some(file),
-            path: lock_path,
-        })
+        Ok(Self { _file: file })
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for SingleInstanceGuard {
-    fn drop(&mut self) {
-        drop(self.file.take());
-        if let Err(err) = fs::remove_file(&self.path) {
-            warn!("failed to remove lock file {}: {err}", self.path.display());
-        }
+    fn drop(&mut self) {}
+}
+
+#[cfg(windows)]
+fn single_instance_mutex_name(data_dir: &Path) -> Result<String> {
+    let canonical = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    Ok(format!(
+        "Local\\{}-{:016x}",
+        APP_NAME,
+        stable_lock_name_hash(&canonical)
+    ))
+}
+
+#[cfg(windows)]
+fn stable_lock_name_hash(path: &Path) -> u64 {
+    let normalized = path.display().to_string().to_ascii_lowercase();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in normalized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
     }
+    hash
+}
+
+#[cfg(windows)]
+fn to_wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 async fn self_test() -> Result<()> {
@@ -1362,36 +1463,53 @@ async fn self_test() -> Result<()> {
         dialog_timeout_seconds: 1,
         ..Config::default()
     };
-    let listener = TcpListener::bind(config.listen_addr).await?;
+    let data_dir = std::env::temp_dir().join("remote-askpass-self-test");
+    let listener = std::net::TcpListener::bind(config.listen_addr)?;
     let addr = listener.local_addr()?;
+    let tls_config = build_server_tls_rustls_config(&config, &data_dir)?;
     let app = build_app(
         config,
-        std::env::temp_dir().join("remote-askpass-self-test"),
+        data_dir,
         Arc::new(FixedPromptProvider {
             password: "self-test-password".to_string(),
         }),
     );
 
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let handle = Handle::new();
+    let server_handle = handle.clone();
+    let server = tokio::spawn(async move {
+        axum_server::from_tcp_rustls(listener, tls_config)
+            .handle(server_handle)
+            .serve(app.into_make_service())
+            .await
+    });
+    handle
+        .listening()
+        .await
+        .context("TLS server did not start listening")?;
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
     let prompt = urlencoding::encode("sudo password:");
-    let url = format!("http://{addr}/ask?prompt={prompt}&nonce=selftest&host=self&user=tester");
+    let url = format!("https://{addr}/ask?prompt={prompt}&nonce=selftest&host=self&user=tester");
     let response = client.get(url).send().await?;
     let status = response.status();
     let body = response.text().await?;
     if status != StatusCode::OK || body != "self-test-password\n" {
-        server.abort();
+        handle.graceful_shutdown(Some(Duration::from_secs(1)));
+        let _ = server.await;
         return Err(anyhow!(
             "self-test ask failed: status={status}, body={body:?}"
         ));
     }
 
     let missing_prompt = client
-        .get(format!("http://{addr}/ask"))
+        .get(format!("https://{addr}/ask"))
         .send()
         .await?
         .status();
-    server.abort();
+    handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    let _ = server.await;
     if missing_prompt != StatusCode::BAD_REQUEST {
         return Err(anyhow!(
             "self-test missing prompt failed: status={missing_prompt}"
@@ -1409,25 +1527,47 @@ async fn wsl_self_test() -> Result<()> {
         dialog_timeout_seconds: 1,
         ..Config::default()
     };
-    let listener = TcpListener::bind(config.listen_addr).await?;
+    let data_dir = std::env::temp_dir().join("remote-askpass-wsl-self-test");
+    let listener = std::net::TcpListener::bind(config.listen_addr)?;
     let addr = listener.local_addr()?;
+    let tls_config = build_server_tls_rustls_config(&config, &data_dir)?;
     let app = build_app(
         config,
-        std::env::temp_dir().join("remote-askpass-wsl-self-test"),
+        data_dir,
         Arc::new(FixedPromptProvider {
             password: "wsl-self-test-password".to_string(),
         }),
     );
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let handle = Handle::new();
+    let server_handle = handle.clone();
+    let server = tokio::spawn(async move {
+        axum_server::from_tcp_rustls(listener, tls_config)
+            .handle(server_handle)
+            .serve(app.into_make_service())
+            .await
+    });
+    handle
+        .listening()
+        .await
+        .context("TLS server did not start listening")?;
     let url = format!(
-        "http://{gateway}:{}/ask?prompt=sudo%20password%3A&nonce=wsl-selftest&host=wsl",
+        "https://{gateway}:{}/ask?prompt=sudo%20password%3A&nonce=wsl-selftest&host=wsl",
         addr.port()
     );
     let output = Command::new("wsl.exe")
-        .args(["--exec", "curl", "--silent", "--show-error", "--fail", &url])
+        .args([
+            "--exec",
+            "curl",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--insecure",
+            &url,
+        ])
         .output()
         .context("failed to run wsl.exe curl")?;
-    server.abort();
+    handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    let _ = server.await;
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -1460,18 +1600,31 @@ async fn wsl_sudo_self_test() -> Result<()> {
         dialog_timeout_seconds: 1,
         ..Config::default()
     };
-    let listener = TcpListener::bind(config.listen_addr).await?;
+    let data_dir = std::env::temp_dir().join("remote-askpass-wsl-sudo-self-test");
+    let listener = std::net::TcpListener::bind(config.listen_addr)?;
     let addr = listener.local_addr()?;
+    let tls_config = build_server_tls_rustls_config(&config, &data_dir)?;
     let state = build_state(
         config,
-        std::env::temp_dir().join("remote-askpass-wsl-sudo-self-test"),
+        data_dir,
         Arc::new(FixedPromptProvider {
             password: wsl_password,
         }),
     );
     let app = build_router(state.clone());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let url = format!("http://{gateway}:{}/ask", addr.port());
+    let handle = Handle::new();
+    let server_handle = handle.clone();
+    let server = tokio::spawn(async move {
+        axum_server::from_tcp_rustls(listener, tls_config)
+            .handle(server_handle)
+            .serve(app.into_make_service())
+            .await
+    });
+    handle
+        .listening()
+        .await
+        .context("TLS server did not start listening")?;
+    let url = format!("https://{gateway}:{}/ask", addr.port());
     let temp_name = format!("/tmp/remote-askpass-{}", make_nonce());
     let config_path = format!("{temp_name}/config.json");
     let helper_path = format!("{temp_name}/remote-askpass");
@@ -1491,7 +1644,7 @@ cat > {config_path} <<'JSON'
 {{
   "agent_url": {url_json},
   "transport_mode": "wsl-local",
-  "tls_mode": "disabled_for_local_testing",
+  "tls_mode": "server_tls",
   "client_cert_path": "",
   "client_key_path": "",
   "server_ca_path": "",
@@ -1517,7 +1670,8 @@ sudo -A -k true
     );
     let output = run_wsl_shell(Some(&wsl_account), &script)
         .context("failed to run WSL sudo askpass test")?;
-    server.abort();
+    handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    let _ = server.await;
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -1550,18 +1704,30 @@ async fn wsl_installed_helper_self_test() -> Result<()> {
         dialog_timeout_seconds: 1,
         ..Config::default()
     };
-    let listener = TcpListener::bind(config.listen_addr)
-        .await
+    let data_dir = std::env::temp_dir().join("remote-askpass-wsl-installed-helper-self-test");
+    let listener = std::net::TcpListener::bind(config.listen_addr)
         .with_context(|| format!("failed to bind {}", config.listen_addr))?;
+    let tls_config = build_server_tls_rustls_config(&config, &data_dir)?;
     let state = build_state(
         config,
-        std::env::temp_dir().join("remote-askpass-wsl-installed-helper-self-test"),
+        data_dir,
         Arc::new(FixedPromptProvider {
             password: wsl_password,
         }),
     );
     let app = build_router(state.clone());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let handle = Handle::new();
+    let server_handle = handle.clone();
+    let server = tokio::spawn(async move {
+        axum_server::from_tcp_rustls(listener, tls_config)
+            .handle(server_handle)
+            .serve(app.into_make_service())
+            .await
+    });
+    handle
+        .listening()
+        .await
+        .context("TLS server did not start listening")?;
     let script = r#"
 set -eu
 test -x "$HOME/.local/bin/remote-askpass"
@@ -1572,7 +1738,8 @@ PATH="$HOME/.local/bin:$PATH" rsudo true
 "#;
     let output = run_wsl_shell(Some(&wsl_account), script)
         .context("failed to run installed WSL helper test")?;
-    server.abort();
+    handle.graceful_shutdown(Some(Duration::from_secs(1)));
+    let _ = server.await;
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -1602,7 +1769,7 @@ fn wsl_install_helper(account: Option<&str>, agent_url: Option<&str>) -> Result<
         .context("failed to resolve linux-helper/rsudo for WSL")?;
     let agent_url = match agent_url {
         Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-        _ => format!("http://{}:{DEFAULT_PORT}/ask", wsl_gateway()?),
+        _ => format!("https://{}:{DEFAULT_PORT}/ask", wsl_gateway()?),
     };
     let script = format!(
         r#"
@@ -1627,7 +1794,7 @@ cat > "$cfg_dir/config.json" <<'JSON'
 {{
   "agent_url": {agent_url_json},
   "transport_mode": "wsl-local",
-  "tls_mode": "disabled_for_local_testing",
+  "tls_mode": "server_tls",
   "client_cert_path": "",
   "client_key_path": "",
   "server_ca_path": "",
@@ -1764,17 +1931,16 @@ fn load_or_create_config(path: &Path) -> Result<Config> {
     if path.exists() {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        return serde_json::from_str(&text)
-            .with_context(|| format!("failed to parse config {}", path.display()));
+        let mut config: Config = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse config {}", path.display()))?;
+        if migrate_legacy_config(&mut config) {
+            write_config(path, &config)?;
+        }
+        return Ok(config);
     }
 
     let config = Config::default();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config dir {}", parent.display()))?;
-    }
-    fs::write(path, serde_json::to_string_pretty(&config)?)
-        .with_context(|| format!("failed to write config {}", path.display()))?;
+    write_config(path, &config)?;
     Ok(config)
 }
 
@@ -1785,6 +1951,36 @@ fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
 
     let appdata = std::env::var_os("APPDATA").ok_or_else(|| anyhow!("APPDATA is not set"))?;
     Ok(PathBuf::from(appdata).join(APP_NAME).join("config.json"))
+}
+
+fn write_config(path: &Path, config: &Config) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config dir {}", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_string_pretty(config)?)
+        .with_context(|| format!("failed to write config {}", path.display()))
+}
+
+fn migrate_legacy_config(config: &mut Config) -> bool {
+    let mut changed = false;
+
+    if config.listen_addr.ip().is_loopback() && config.listen_addr.port() == 7878 {
+        config.listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_PORT);
+        changed = true;
+    }
+
+    if config.tls_mode == TlsMode::DisabledForLocalTesting {
+        config.tls_mode = TlsMode::ServerTls;
+        changed = true;
+    }
+
+    if config.linux_config_agent_url.trim() == "http://127.0.0.1:7878/ask" {
+        config.linux_config_agent_url = format!("https://127.0.0.1:{DEFAULT_PORT}/ask");
+        changed = true;
+    }
+
+    changed
 }
 
 fn startup_dir() -> Result<PathBuf> {
@@ -2465,5 +2661,21 @@ mod tests {
 
         handle.graceful_shutdown(Some(Duration::from_secs(1)));
         server.await.unwrap().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn single_instance_guard_rejects_second_acquire_and_recovers_after_drop() {
+        let data_dir = test_data_dir("single-instance");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let first = SingleInstanceGuard::acquire(&data_dir).unwrap();
+        let second = SingleInstanceGuard::acquire(&data_dir);
+        assert!(second.is_err());
+
+        drop(first);
+
+        let third = SingleInstanceGuard::acquire(&data_dir);
+        assert!(third.is_ok());
     }
 }

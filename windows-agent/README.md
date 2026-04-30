@@ -17,7 +17,7 @@ For local tests:
 
 ```powershell
 cargo run -p remote-askpass-windows-agent -- serve --listen 127.0.0.1:17878 --test-password test-password
-curl.exe --get --data-urlencode "prompt=sudo password:" http://127.0.0.1:17878/ask
+curl.exe --insecure --get --data-urlencode "prompt=sudo password:" https://127.0.0.1:17878/ask
 ```
 
 ## Local API
@@ -65,7 +65,7 @@ cargo run -p remote-askpass-windows-agent -- wsl-installed-helper-self-test
 `wsl-self-test` starts an ephemeral Windows-side server, asks WSL for its Windows gateway, and verifies that WSL `curl` can reach `/ask`.
 `wsl-sudo-self-test` reads `WSL-account` and `WSL-Password` from the local `.env`, starts an ephemeral Windows-side server, runs the real `linux-helper/remote-askpass` inside WSL with a temporary config, and verifies that `sudo -A` reaches `/ask`. The secret values are not logged.
 
-`wsl-install-helper` installs `remote-askpass`, `rsudo`, and a working HTTP-over-WSL config into the selected WSL account. Existing files are backed up with a timestamp suffix before replacement. Start the Windows agent with `--listen 0.0.0.0:17878` for this WSL-local config.
+`wsl-install-helper` installs `remote-askpass`, `rsudo`, and a working HTTPS-over-WSL config into the selected WSL account. Existing files are backed up with a timestamp suffix before replacement. Start the Windows agent with `--listen 0.0.0.0:17878` for this WSL-local config. When no CA path is configured yet, the helper uses curl `--insecure`; the channel is still encrypted and never falls back to plaintext HTTP.
 
 `wsl-installed-helper-self-test` starts an ephemeral Windows-side server on `0.0.0.0:17878` and verifies that the installed WSL `rsudo true` path reaches `/ask`.
 
@@ -82,4 +82,4 @@ This creates or removes a Startup folder `.cmd` launcher for the current executa
 
 This is a Windows-first MVP of the Agent model: config, HTTP API, request validation, native Windows Credential UI prompt, prompt provider abstraction, startup registration, tray menu, single-instance lock, recent request recording, runtime enable/disable, pairing-window record capture, certificate issuance from CSR, and self-test support.
 
-App-layer mTLS is wired for the HTTPS listener when `tls_mode` is `mtls`; keep `disabled_for_local_testing` only for local HTTP development.
+The agent always serves encrypted TLS in `serve`, including legacy configs that still say `disabled_for_local_testing`. Use `tls_mode = "server_tls"` for encrypted server-only TLS, or `tls_mode = "mtls"` when the client must also authenticate with a certificate.
